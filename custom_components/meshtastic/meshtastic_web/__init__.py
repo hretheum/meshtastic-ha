@@ -252,7 +252,7 @@ class MeshtasticWebConfigEntryView(HomeAssistantView):
 
         config_entry = self._hass.config_entries.async_get_entry(entity.config_entry_id)
         if config_entry is None:
-            return web.HTTPNotFound()
+            return web.HTTPNotFound(headers={"Cache-Control": "no-cache"})
         if config_entry.state != ConfigEntryState.LOADED:
             return web.HTTPBadGateway(
                 body=f"Gateway is not ready (config entry state {config_entry.state.value})",
@@ -310,7 +310,7 @@ class MeshtasticWebApiV1View(HomeAssistantView):
             # AttributeError and the caller answers 500 with a stack trace
             # instead of an honest 404.
             raise web.HTTPNotFound(
-                body=f"Unknown config entry {config_entry_id}",
+                text="Unknown config entry",
                 content_type="text/plain",
                 headers={"Cache-Control": "no-cache"},
             )
