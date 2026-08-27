@@ -1,0 +1,19 @@
+custom_components/meshtastic/meshtastic_web/__init__.py
+  s_4a7f1e3644472b::t_a914957d367a49 255,313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f556f2e1f1789107f1a8902c0cef9ed0440fb7d4",
+  "prompts": {},
+  "sessions": {
+    "s_4a7f1e3644472b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47db9525-6d0d-435b-9c1f-2745b3bf581f",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Eryk Orłowski <eryk@talentcanvas.tech>"
+    }
+  }
+}
