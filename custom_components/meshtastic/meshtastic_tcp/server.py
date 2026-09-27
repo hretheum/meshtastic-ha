@@ -22,9 +22,11 @@ _LOGGER = LOGGER.getChild(__name__)
 _CONFIG_SNAPSHOT_TIMEOUT = 60
 # How old a snapshot may get before it is refreshed in the background.
 _CONFIG_SNAPSHOT_MAX_AGE = 300
-# Shortest gap between two gateway session refreshes, so that a client which asks for
-# its config twice in a row does not trigger two dumps.
-_CONFIG_REARM_MIN_INTERVAL = 15
+# Special nonce that asks the gateway for its config without the node database. The
+# firmware answers it quickly, where a full dump keeps the link busy for many seconds.
+_CONFIG_ID_MINIMAL = 69420
+# Shortest gap between two gateway session refreshes.
+_SESSION_REARM_MIN_INTERVAL = 60
 # FromRadio variants that make up a config download. Live traffic (mesh packets, queue
 # status, log records) arrives on the same stream and must not end up in the snapshot.
 _CONFIG_SNAPSHOT_VARIANTS = frozenset(
@@ -110,7 +112,7 @@ class MeshtasticTcpProxy:
 
         self._config_snapshot: list[mesh_pb2.FromRadio] = []
         self._config_snapshot_at: float | None = None
-        self._config_refresh_at: float | None = None
+        self._session_rearm_at: float | None = None
         self._config_snapshot_ready = asyncio.Event()
         self._config_refresh_lock = asyncio.Lock()
         self._config_capture: list[mesh_pb2.FromRadio] | None = None
@@ -227,10 +229,6 @@ class MeshtasticTcpProxy:
         """
         if not self._config_snapshot_ready.is_set():
             await self._refresh_config_snapshot()
-        elif self._is_config_snapshot_stale():
-            self._config_refresh_task = asyncio.create_task(
-                self._refresh_config_snapshot(), name="tcp_proxy_config_snapshot"
-            )
 
         if not self._config_snapshot_ready.is_set():
             _LOGGER.warning("No config snapshot available for %s, asking the gateway directly", peer_name)
@@ -247,58 +245,88 @@ class MeshtasticTcpProxy:
         await queue.put(config_complete)
         _LOGGER.debug("Served config snapshot (%s packets) to %s", len(self._config_snapshot), peer_name)
 
-        # The firmware keeps a phone session that a config request re-arms, and it stops
-        # answering admin requests once that session goes stale. The client's own request
-        # never reaches the gateway, so ask on its behalf, using an id of our own: the
-        # resulting dump is consumed here instead of reaching the clients, which must not
-        # see a second completion for an id they already finished with.
-        self._config_refresh_task = asyncio.create_task(
-            self._refresh_config_snapshot(force=True), name="tcp_proxy_config_refresh"
-        )
+        # Only when this client is the only one connected. Any config request keeps the
+        # gateway from sending anything else for ten seconds or more, and a client hangs up
+        # when the gateway goes quiet while it waits on a heartbeat, so a client joining an
+        # existing session must never trigger one. It does not need to either: whoever
+        # connected first already re-armed the session.
+        if len(self._client_queues) <= 1:
+            self._config_refresh_task = asyncio.create_task(self._refresh_gateway(), name="tcp_proxy_gateway_refresh")
+
+    async def _refresh_gateway(self) -> None:
+        if self._is_config_snapshot_stale():
+            await self._refresh_config_snapshot()
+        else:
+            await self._rearm_gateway_session()
 
     def _is_config_snapshot_stale(self) -> bool:
         if self._config_snapshot_at is None:
             return True
         return (asyncio.get_running_loop().time() - self._config_snapshot_at) > _CONFIG_SNAPSHOT_MAX_AGE
 
-    async def _refresh_config_snapshot(self, *, force: bool = False) -> None:
+    async def _rearm_gateway_session(self) -> None:
+        """
+        Keep the phone session the firmware maintains for the connected client alive.
+
+        The firmware stops answering admin requests once that session goes stale, and the
+        apps send admin requests right after connecting, so a client whose requests go
+        unanswered hangs up. Only a config request re-arms it, and the client's own request
+        is answered from the snapshot and never reaches the gateway, so ask on its behalf.
+
+        The minimal variant is used on purpose. A full dump keeps the gateway from sending
+        anything else for ten seconds or more, and clients drop the connection once the
+        gateway has been quiet for about twenty, so re-arming with a full dump would cost
+        exactly the connections it is meant to keep.
+        """
         async with self._config_refresh_lock:
             now = asyncio.get_running_loop().time()
-            if force:
-                if self._config_refresh_at is not None and (now - self._config_refresh_at) < _CONFIG_REARM_MIN_INTERVAL:
-                    return
-            elif self._config_snapshot_ready.is_set() and not self._is_config_snapshot_stale():
+            if self._session_rearm_at is not None and (now - self._session_rearm_at) < _SESSION_REARM_MIN_INTERVAL:
                 return
-            self._config_refresh_at = now
+            self._session_rearm_at = now
+            await self._gateway_config_dump(_CONFIG_ID_MINIMAL, keep=False)
+
+    async def _refresh_config_snapshot(self) -> None:
+        async with self._config_refresh_lock:
+            if self._config_snapshot_ready.is_set() and not self._is_config_snapshot_stale():
+                return
 
             # 0 is the default value of config_complete_id, so it can not be used as an id.
             config_id = random.randint(1, 0xFFFFFFFF)  # noqa: S311
-            to_radio = mesh_pb2.ToRadio()
-            to_radio.want_config_id = config_id
-
-            done = asyncio.Event()
-            self._config_capture = []
-            self._config_capture_id = config_id
-            self._config_capture_done = done
-            try:
-                await self._interface._connection._send_packet(to_radio.SerializeToString())  # noqa: SLF001
-                await asyncio.wait_for(done.wait(), timeout=_CONFIG_SNAPSHOT_TIMEOUT)
-            except TimeoutError:
-                _LOGGER.warning(
-                    "Gateway did not finish config dump %s within %s seconds, keeping previous snapshot",
-                    config_id,
-                    _CONFIG_SNAPSHOT_TIMEOUT,
-                )
+            if config_id == _CONFIG_ID_MINIMAL:
+                config_id += 1
+            packets = await self._gateway_config_dump(config_id, keep=True)
+            if packets is None:
                 return
-            else:
-                self._config_snapshot = self._config_capture
-                self._config_snapshot_at = asyncio.get_running_loop().time()
-                self._config_snapshot_ready.set()
-                _LOGGER.debug("Refreshed config snapshot, %s packets", len(self._config_snapshot))
-            finally:
-                self._config_capture = None
-                self._config_capture_id = None
-                self._config_capture_done = None
+            self._config_snapshot = packets
+            self._config_snapshot_at = asyncio.get_running_loop().time()
+            self._session_rearm_at = self._config_snapshot_at
+            self._config_snapshot_ready.set()
+            _LOGGER.debug("Refreshed config snapshot, %s packets", len(self._config_snapshot))
+
+    async def _gateway_config_dump(self, config_id: int, *, keep: bool) -> list[mesh_pb2.FromRadio] | None:
+        to_radio = mesh_pb2.ToRadio()
+        to_radio.want_config_id = config_id
+
+        done = asyncio.Event()
+        self._config_capture = []
+        self._config_capture_id = config_id
+        self._config_capture_done = done
+        try:
+            await self._interface._connection._send_packet(to_radio.SerializeToString())  # noqa: SLF001
+            await asyncio.wait_for(done.wait(), timeout=_CONFIG_SNAPSHOT_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Gateway did not finish config dump %s within %s seconds",
+                config_id,
+                _CONFIG_SNAPSHOT_TIMEOUT,
+            )
+            return None
+        else:
+            return self._config_capture if keep else []
+        finally:
+            self._config_capture = None
+            self._config_capture_id = None
+            self._config_capture_done = None
 
     def _capture_config_packet(self, packet: mesh_pb2.FromRadio) -> bool:
         """
